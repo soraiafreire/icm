@@ -4215,15 +4215,28 @@ fn cmd_hook_end(
     // path, same as the consolidation fork — rate-limited by
     // `BRIEFING_REFRESH_INTERVAL` so a chatty session doesn't trigger an
     // LLM call on every single SessionEnd.
+    //
+    // #471: staleness alone is not enough. The cache mtime only moves when a
+    // refresh *succeeds*, so while the summarizer is failing (expired OAuth,
+    // network down) or when many sessions end within seconds, every
+    // SessionEnd forked yet another worker — 15 `claude -p` in 45 minutes
+    // on one machine. A refresh is now also *claimed*: an attempt marker
+    // next to the cache is created atomically and honoured for
+    // `BRIEFING_RETRY_BACKOFF`, so at most one worker runs per backoff
+    // window regardless of outcome or concurrency.
     if consolidate_cfg.summarizer.provider != "none" {
         let project = detect_project();
-        let stale = project != "unknown"
-            && !project.is_empty()
-            && briefing_cache_path(&project)
-                .map(|p| briefing_cache_is_stale(&p, BRIEFING_REFRESH_INTERVAL))
-                .unwrap_or(true);
-        if stale {
-            spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
+        if project != "unknown" && !project.is_empty() {
+            if let Some(cache) = briefing_cache_path(&project) {
+                if briefing_cache_is_stale(&cache, BRIEFING_REFRESH_INTERVAL)
+                    && try_claim_briefing_refresh(
+                        &briefing_refresh_marker(&cache),
+                        BRIEFING_RETRY_BACKOFF,
+                    )
+                {
+                    spawn_detached_worker(&["briefing", "--project", project.as_str()], "briefing");
+                }
+            }
         }
     }
 
@@ -8958,6 +8971,49 @@ fn briefing_cache_is_stale(path: &std::path::Path, max_age: std::time::Duration)
     }
 }
 
+/// Minimum spacing between two briefing refresh *attempts* for one project
+/// (#471), successful or not. Bounds the damage while the summarizer is
+/// broken: one worker per window instead of one per SessionEnd.
+const BRIEFING_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Attempt marker that sits next to a briefing cache file: `<cache>.refresh`.
+fn briefing_refresh_marker(cache: &std::path::Path) -> PathBuf {
+    let mut name = cache
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".refresh");
+    cache.with_file_name(name)
+}
+
+/// Claim the right to spawn one briefing refresh (#471). Returns `true` for
+/// exactly one caller per `backoff` window:
+///
+/// * a marker younger than `backoff` means an attempt is in flight or just
+///   failed — do not pile on;
+/// * an older (or missing) marker is replaced through `create_new`, which is
+///   atomic on every platform, so two SessionEnds racing for the same
+///   project cannot both win.
+///
+/// Pure with respect to the store; only touches the marker file.
+fn try_claim_briefing_refresh(marker: &std::path::Path, backoff: std::time::Duration) -> bool {
+    if let Ok(modified) = std::fs::metadata(marker).and_then(|m| m.modified()) {
+        if modified.elapsed().map(|age| age < backoff).unwrap_or(true) {
+            return false;
+        }
+        // Stale marker from a previous window: clear it so create_new can win.
+        let _ = std::fs::remove_file(marker);
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+}
+
 /// Build the LLM prompt that compiles a project's memories into a structured
 /// wake-up briefing (issue #165).
 fn build_briefing_prompt(
@@ -11387,6 +11443,59 @@ mod hook_start_tests {
         ));
         // ... but stale under a max_age of zero (anything is "older").
         assert!(briefing_cache_is_stale(&path, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn briefing_refresh_marker_sits_next_to_the_cache() {
+        let cache = std::path::Path::new("/tmp/icm/briefings/proj.md");
+        assert_eq!(
+            briefing_refresh_marker(cache),
+            std::path::Path::new("/tmp/icm/briefings/proj.md.refresh")
+        );
+    }
+
+    #[test]
+    fn briefing_refresh_claim_is_exclusive_per_backoff_window() {
+        // #471: a failing summarizer must not turn every SessionEnd into a
+        // new worker. One claim per window, whatever the previous outcome.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("sub").join("proj.md.refresh");
+        let backoff = std::time::Duration::from_secs(3600);
+
+        // First caller wins (and the parent dir is created on demand).
+        assert!(try_claim_briefing_refresh(&marker, backoff));
+        assert!(marker.exists());
+        // Second caller inside the window loses — nothing succeeded in
+        // between, exactly the storm scenario.
+        assert!(!try_claim_briefing_refresh(&marker, backoff));
+        assert!(!try_claim_briefing_refresh(&marker, backoff));
+        // Once the window has elapsed (zero backoff: anything is old), the
+        // stale marker is replaced and a new claim succeeds — but still only
+        // one per window.
+        assert!(try_claim_briefing_refresh(
+            &marker,
+            std::time::Duration::ZERO
+        ));
+        assert!(!try_claim_briefing_refresh(&marker, backoff));
+    }
+
+    #[test]
+    fn briefing_refresh_claim_races_have_one_winner() {
+        // Many sessions ending at once (the reported machine ran ~30) must
+        // yield a single worker, not one each.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("proj.md.refresh");
+        let backoff = std::time::Duration::from_secs(3600);
+        let wins: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| try_claim_briefing_refresh(&marker, backoff)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap() as usize)
+                .sum()
+        });
+        assert_eq!(wins, 1);
     }
 
     #[test]
