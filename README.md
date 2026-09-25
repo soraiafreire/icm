@@ -149,7 +149,7 @@ root, so all `icm` commands run from within the project automatically
 use an isolated database. Combine with global `icm init` — global
 settings (tools, hooks) are unaffected; only the database is scoped.
 
-Configures **18 tools** in one command ([full integration guide](docs/integrations.md)):
+Configures **19 tools** in one command ([full integration guide](docs/integrations.md)):
 
 | Tool | MCP | Hooks | CLI | Skills |
 |------|:---:|:-----:|:---:|:------:|
@@ -171,6 +171,7 @@ Configures **18 tools** in one command ([full integration guide](docs/integratio
 | Continue.dev | `~/.continue/config.yaml` | — | — | — |
 | Aider | — | — | `.aider.conventions.md` | — |
 | Pi | — | TS ext (TBD) | `~/.pi/agent/AGENTS.md` | `/icm-recall` `/icm-remember` |
+| Mistral Vibe | `~/.vibe/config.toml` | 2 hooks | `~/.vibe/AGENTS.md` | `/icm-recall` `/icm-remember` `/icm-remember-session` |
 
 Or manually:
 
@@ -190,7 +191,7 @@ claude mcp add icm -- icm serve --compact
 icm init --mode skill
 ```
 
-Installs slash commands and rules for Claude Code (`/recall`, `/remember`), Cursor (`.mdc` rule), Roo Code (`.md` rule), and Amp (`/icm-recall`, `/icm-remember`).
+Installs slash commands and rules for Claude Code (`/recall`, `/remember`), Cursor (`.mdc` rule), Roo Code (`.md` rule), Amp (`/icm-recall`, `/icm-remember`), and Mistral Vibe (`/icm-recall`, `/icm-remember`, `/icm-remember-session` skills).
 
 ### CLI instructions
 
@@ -207,8 +208,9 @@ Injects ICM instructions into each tool's instruction file:
 | Windsurf | `.windsurfrules` |
 | OpenAI Codex | `AGENTS.md` |
 | Gemini | `~/.gemini/GEMINI.md` |
+| Mistral Vibe | `~/.vibe/AGENTS.md` |
 
-### Hooks (5 tools)
+### Hooks (6 tools)
 
 ```bash
 icm init --mode hook
@@ -223,6 +225,7 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 | Codex CLI | `icm hook start` | `icm hook pre` | `icm hook post`¹ | — | `icm hook prompt` | `~/.codex/hooks.json` |
 | Copilot CLI | `icm hook start` | `icm hook pre` | `icm hook post` | — | `icm hook prompt` | `.github/hooks/icm.json` |
 | OpenCode | session start | — | tool extract | compaction | — | `~/.config/opencode/plugins/icm.ts` |
+| Mistral Vibe | —² | `icm hook pre` | `icm hook post` | — | — | `~/.vibe/hooks.toml` |
 
 **What each hook does:**
 
@@ -236,6 +239,8 @@ Installs auto-extraction and auto-recall hooks for all supported tools:
 
 ¹ **Codex CLI PostToolUse is off by default.** Codex fires PostToolUse on every shell command — a session generates ~14k events / 24h, which floods the store with tool-output bloat (issue #288). Opt in with `icm init --with-codex-post-hook` if you want it; tune `[extraction]` first (`extract_every`, `min_score`, `store_raw = false`). MCP + `AGENTS.md` alone still let Codex save via the `icm_memory_store` tool.
 
+² **Mistral Vibe's hook system only offers `pre_tool`, `post_tool` and `post_agent` lifecycle events** — there is no SessionStart / UserPromptSubmit / PreCompact equivalent, so no wake-up pack or prompt-recall hook exists for Vibe. Recall at session start is covered by the `~/.vibe/AGENTS.md` instructions from `icm init --mode cli` instead. Vibe hooks live in `~/.vibe/hooks.toml` (TOML, `[[hooks]]` array of tables).
+
 ## CLI vs MCP
 
 ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both access the same database.
@@ -245,7 +250,7 @@ ICM can be used via CLI (`icm` commands) or MCP server (`icm serve`). Both acces
 | **Latency** | ~30ms (direct binary) | ~50ms (JSON-RPC stdio) |
 | **Token cost** | 0 (hook-based, invisible) | ~20-50 tokens/call (tool schema) |
 | **Setup** | `icm init --mode hook` | `icm init --mode mcp` |
-| **Works with** | Claude Code, Gemini, Codex, Copilot, OpenCode (via hooks) | All 17 MCP-compatible tools |
+| **Works with** | Claude Code, Gemini, Codex, Copilot, OpenCode, Mistral Vibe (via hooks) | All 17 MCP-compatible tools |
 | **Auto-extraction** | Yes (hooks trigger `icm extract`) | Yes (MCP tools call store) |
 | **Best for** | Power users, token savings | Universal compatibility |
 
